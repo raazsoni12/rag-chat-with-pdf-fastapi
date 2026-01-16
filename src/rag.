@@ -1,0 +1,134 @@
+import os
+import tempfile
+from typing import Dict, Any
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+from src.utils import get_provider
+
+
+def load_pdf_chunks(pdf_path: str):
+    """
+    Load PDF and split into chunks.
+    Each loaded doc has metadata including page number: {"page": 0, 1, 2, ...}
+    """
+    loader = PyPDFLoader(pdf_path)
+    docs = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=900,
+        chunk_overlap=150
+    )
+    chunks = splitter.split_documents(docs)
+    return chunks
+
+
+def build_vectorstore(chunks):
+    """
+    Embeddings run locally (FREE) using sentence-transformers.
+    No API required for embeddings.
+    """
+    embedder = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    db = FAISS.from_documents(chunks, embedder)
+    return db
+
+
+def retrieve_context_with_citations(db, question: str, k: int = 4) -> Dict[str, Any]:
+    docs = db.similarity_search(question, k=k)
+
+    citations = []
+    context_parts = []
+
+    for i, d in enumerate(docs, start=1):
+        page = d.metadata.get("page", None)
+        page_no = page + 1 if isinstance(page, int) else "?"
+
+        citations.append({
+            "chunk": i,
+            "page": page_no,
+            "preview": d.page_content[:220].replace("\n", " ")
+        })
+
+        # Add source info into context for grounding
+        context_parts.append(f"[Source: Page {page_no}] {d.page_content}")
+
+    context = "\n\n".join(context_parts)
+    return {"context": context, "citations": citations}
+
+
+def ask_llm(question: str, context: str) -> str:
+    provider = get_provider()
+    if not provider:
+        raise ValueError("No API key found. Add GEMINI_API_KEY or OPENAI_API_KEY in .env")
+
+    prompt = f"""
+You are an AI assistant.
+Answer ONLY using the context below.
+If the answer is not present in the context, say exactly:
+"I don't know based on the provided PDF."
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+""".strip()
+
+    if provider == "gemini":
+        import google.generativeai as genai
+
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        resp = model.generate_content(prompt)
+        return resp.text.strip()
+
+    if provider == "openai":
+        from openai import OpenAI
+
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Answer strictly using the provided context."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content.strip()
+
+    raise ValueError("Unsupported provider")
+
+
+def process_pdf_and_answer(pdf_bytes: bytes, question: str) -> Dict[str, Any]:
+    """
+    Full pipeline:
+    PDF bytes -> temp PDF -> chunk -> FAISS -> retrieve -> LLM -> answer + citations
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        pdf_path = tmp.name
+
+    try:
+        chunks = load_pdf_chunks(pdf_path)
+        db = build_vectorstore(chunks)
+
+        retrieved = retrieve_context_with_citations(db, question, k=4)
+        answer = ask_llm(question, retrieved["context"])
+
+        return {
+            "question": question,
+            "answer": answer,
+            "citations": retrieved["citations"]
+        }
+    finally:
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+
