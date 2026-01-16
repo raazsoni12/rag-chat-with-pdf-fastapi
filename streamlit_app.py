@@ -6,7 +6,8 @@ st.set_page_config(page_title="RAG Chat with PDF", page_icon="📄", layout="wid
 st.title("📄 RAG Chat with PDF Assistant")
 st.caption("Upload a PDF and ask questions. The system answers only from the document with citations.")
 
-API_URL = "http://127.0.0.1:8000/ask"
+API_URL = "https://rag-chat-with-pdf-fastapi.onrender.com/ask"
+
 
 pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
 question = st.text_input("Ask a question", placeholder="Example: What is this PDF about?")
